@@ -1,9 +1,18 @@
-"""生产实现的全部逻辑都堆在这里。
+"""生产实现（已重构）：单遍流式流水线，按阶段拆成命名清晰的函数。
 
-.. warning::
-   业务口径**以 ``legacy/report_legacy.py`` 文件头的 docstring 为准**。
-   本文件里的解析/格式化函数是从 legacy 复制过来的一份拷贝（历史原因：
-   当年不敢动 legacy，就整个抄了一遍），重构时应当消除这份重复。
+业务口径**以 ``legacy/report_legacy.py`` 文件头的 docstring 为准**，本模块
+只在结构上与 legacy 不同：
+
+* **加载**：:func:`iter_csv_rows` 流式逐行产出，不再把整个文件读进内存、
+  更不按 region 重复读文件；
+* **归一 + 分组**：:func:`aggregate_orders` 单遍完成 ts 解析、金额归一、
+  ``(region, month)`` 分组累加与 ``order_id`` 首次归属登记；
+* **退款归属**：:func:`attribute_refunds` 用 ``order_id -> (region, month)``
+  字典 O(1) 查归属，不再线性扫全表；
+* **落盘**：:func:`write_outputs` 负责两个产物文件。
+
+无模块级可变状态；组内累加顺序 = 文件出现顺序、总额累加顺序 =
+``sorted(keys)``，与 legacy 完全一致（求和顺序是口径的一部分）。
 """
 
 from __future__ import annotations
@@ -12,11 +21,32 @@ import argparse
 import csv
 import json
 import os
-import sys
-from collections import OrderedDict
+from dataclasses import dataclass, field
 from datetime import datetime
+from typing import Iterable, Iterator
 
-__all__ = ["build_parser", "run"]
+__all__ = [
+    "CSV_FILE",
+    "DEFAULT_ORDERS",
+    "DEFAULT_OUT",
+    "DEFAULT_REFUNDS",
+    "ORDER_COLUMNS",
+    "OUTPUT_COLUMNS",
+    "REFUND_COLUMNS",
+    "SUMMARY_FILE",
+    "OrderAggregation",
+    "RefundAggregation",
+    "aggregate_orders",
+    "attribute_refunds",
+    "build_parser",
+    "fmt_money",
+    "iter_csv_rows",
+    "parse_amount",
+    "parse_month",
+    "run",
+    "total_of",
+    "write_outputs",
+]
 
 ORDER_COLUMNS = ("order_id", "region", "ts", "amount")
 REFUND_COLUMNS = ("refund_id", "order_id", "amount")
@@ -36,25 +66,27 @@ DEFAULT_OUT = "out"
 CSV_FILE = "monthly_region.csv"
 SUMMARY_FILE = "summary.json"
 
-#: 历史遗留的模块级可变状态：统计「这个进程一共读了多少次文件」。
-#: 它不影响产物内容，但会让同一进程里连跑两次报表的结果互相串味，
-#: 单元测试尤其难受。重构时应当删掉，改成显式的返回值或局部变量。
-_FILES_READ = [0]
-
-#: 历史遗留：当年想做「行缓存」省掉重复 IO，写了一半没接上，一直是空的。
-_ROW_CACHE = {}
-
 
 # --------------------------------------------------------------------------
-# 下面这一整块 parse/format 是从 legacy 抄过来的重复实现
+# 基础解析 / 格式化（口径与 legacy 逐字一致）
 # --------------------------------------------------------------------------
-def fmt_money(value):
-    """金额落盘口径，和 legacy 的 ``fmt_money`` 完全一样。"""
+def fmt_money(value: float) -> str:
+    """金额落盘口径：``round()`` 到两位再定宽格式化（见怪癖 Q1）。
+
+    :param value: 未舍入的 float 金额。
+    :returns: 形如 ``"2.67"``、``"1234.56"`` 的字符串。
+    """
     return f"{round(value, 2):.2f}"
 
 
-def parse_month(ts):
-    """``ts`` → ``YYYY-MM``，解析不出来返回 ``None``。和 legacy 一样不做时区换算。"""
+def parse_month(ts: str | None) -> str | None:
+    """把 ``ts`` 解析成 ``YYYY-MM``；解析不出来返回 ``None``（该行算坏行）。
+
+    不做任何时区换算（见怪癖 Q6）。
+
+    :param ts: 订单行的 ``ts`` 单元格。
+    :returns: ``"2026-09"`` 这样的月份串，或 ``None``。
+    """
     text = (ts or "").strip()
     if not text:
         return None
@@ -65,8 +97,12 @@ def parse_month(ts):
     return f"{moment.year:04d}-{moment.month:02d}"
 
 
-def parse_amount(text):
-    """金额 → float，空/坏按 ``0.0``。和 legacy 一样。"""
+def parse_amount(text: str | None) -> float:
+    """把金额字段解析成 float；空串或坏值按 ``0.0``（见口径 2、6）。
+
+    :param text: CSV 单元格原始字符串。
+    :returns: float 金额。
+    """
     value = (text or "").strip()
     if not value:
         return 0.0
@@ -76,150 +112,156 @@ def parse_amount(text):
         return 0.0
 
 
-def read_all_rows(path, required):
-    """把整个 CSV 一次读进内存变成 ``list[dict]``。
+def total_of(mapping: dict[tuple[str, str], float]) -> float:
+    """按 ``sorted(keys)`` 的顺序把各组金额加起来。
 
-    每次都真的去磁盘读一遍，并且把 ``_FILES_READ`` 加一。
+    .. warning::
+       求和顺序是口径的一部分（口径 8）。float 加法不满足结合律，
+       换个顺序 ``fmt_money`` 的结果就可能差一分。
+
+    :param mapping: ``{(region, month): 金额}``。
+    :returns: 未舍入的 float 总和。
     """
-    _FILES_READ[0] += 1
-    with open(path, "r", encoding="utf-8-sig", newline="") as fh:
-        reader = csv.DictReader(fh)
-        fields = reader.fieldnames or []
-        missing = [c for c in required if c not in fields]
-        if missing:
-            raise ValueError(f"{path}: 缺少必需列 {missing}，实际列是 {fields}")
-        rows = []
-        for raw in reader:
-            rows.append({c: (raw.get(c) or "").strip() for c in required})
-    return rows
-
-
-def total_of(mapping):
-    """按 ``sorted(keys)`` 的顺序求和 —— 顺序是口径的一部分，不许改。"""
     total = 0.0
     for key in sorted(mapping):
         total += mapping[key]
     return total
 
 
-def group_by_month_only(rows):
-    """只按月份分组（不分 region）。
+# --------------------------------------------------------------------------
+# 阶段 1：加载（流式，逐行产出，不整表驻留内存）
+# --------------------------------------------------------------------------
+def iter_csv_rows(path: str, required: tuple[str, ...]) -> Iterator[dict[str, str]]:
+    """流式读一个输入 CSV，逐行产出 ``{列名: strip 后的值}`` 字典。
 
-    .. deprecated::
-       2024 年的月度脚本用过，现在没有任何地方调用了。留着只是因为
-       没人敢删。
+    :param path: CSV 路径（按 ``utf-8-sig`` 读，容忍 BOM）。
+    :param required: 必须存在的列名；产出字典只含这些列。
+    :raises ValueError: 缺列时报错，信息里带上文件名与实际列。
     """
-    out = OrderedDict()
+    with open(path, "r", encoding="utf-8-sig", newline="") as fh:
+        reader = csv.DictReader(fh)
+        fields = reader.fieldnames or []
+        missing = [c for c in required if c not in fields]
+        if missing:
+            raise ValueError(f"{path}: 缺少必需列 {missing}，实际列是 {fields}")
+        for raw in reader:
+            yield {c: (raw.get(c) or "").strip() for c in required}
+
+
+# --------------------------------------------------------------------------
+# 阶段 2+3：归一 + 分组（订单侧单遍聚合）
+# --------------------------------------------------------------------------
+@dataclass
+class OrderAggregation:
+    """订单侧单遍聚合的全部中间结果（金额均为**未舍入**的 float）。"""
+
+    gross: dict[tuple[str, str], float] = field(default_factory=dict)
+    counts: dict[tuple[str, str], int] = field(default_factory=dict)
+    first_key: dict[str, tuple[str, str]] = field(default_factory=dict)
+    order_rows: int = 0
+    skipped_rows: int = 0
+    duplicate_order_ids: int = 0
+
+
+def aggregate_orders(rows: Iterable[dict[str, str]]) -> OrderAggregation:
+    """单遍扫描订单行：ts 归一、坏行跳过、按 ``(region, month)`` 分组累加。
+
+    行为口径（与 legacy 一致）：
+
+    * ts 解析失败 → 整行跳过，``skipped_rows += 1``，金额不进任何统计；
+    * amount 空/坏 → 按 ``0.0`` 计，**不跳行**；
+    * 同一个 ``order_id`` 重复出现 → 计 ``duplicate_order_ids``，归属登记
+      只保留**首次出现**的 ``(region, month)``；
+    * 组内金额按**文件出现顺序**累加（求和顺序是口径的一部分）。
+
+    :param rows: :func:`iter_csv_rows` 产出的订单行（列见 ``ORDER_COLUMNS``）。
+    :returns: :class:`OrderAggregation`。
+    """
+    result = OrderAggregation()
+    gross = result.gross
+    counts = result.counts
+    first_key = result.first_key
     for row in rows:
+        result.order_rows += 1
         month = parse_month(row["ts"])
         if month is None:
+            result.skipped_rows += 1
             continue
-        out.setdefault(month, []).append(row)
-    return out
-
-
-# --------------------------------------------------------------------------
-# god-function：加载 / 归一 / 分组 / 退款归属 / 落盘 全挤在这一个函数里
-# --------------------------------------------------------------------------
-def run(orders_path, refunds_path, out_dir):
-    """跑完整条报表流水线，把两个产物写进 ``out_dir``，返回 summary 字典。
-
-    :param orders_path: 订单 CSV 路径。
-    :param refunds_path: 退款 CSV 路径。
-    :param out_dir: 产物输出目录。
-    """
-    # ===================== 阶段 1：加载 =====================
-    # 订单文件先整个读进内存（原始字符串），退款文件也读进来。
-    raw_rows = read_all_rows(orders_path, ORDER_COLUMNS)
-    refund_rows = read_all_rows(refunds_path, REFUND_COLUMNS)
-
-    # ===================== 阶段 2：归一 =====================
-    # 把原始行解析成记录。ts 坏行整行跳过并计入 skipped_rows；
-    # amount 坏值不跳行，按 0.0 计。
-    records = []
-    first_key = {}
-    skipped_rows = 0
-    duplicate_order_ids = 0
-    for row in raw_rows:
-        month = parse_month(row["ts"])
-        if month is None:
-            skipped_rows += 1
-            continue
-        region = row["region"]
-        key = (region, month)
+        key = (row["region"], month)
         order_id = row["order_id"]
         if order_id in first_key:
-            duplicate_order_ids += 1
+            result.duplicate_order_ids += 1
         else:
             first_key[order_id] = key
-        records.append(
-            {
-                "order_id": order_id,
-                "region": region,
-                "month": month,
-                "amount": parse_amount(row["amount"]),
-            }
-        )
+        gross[key] = gross.get(key, 0.0) + parse_amount(row["amount"])
+        counts[key] = counts.get(key, 0) + 1
+    return result
 
-    # ===================== 阶段 3：分组 =====================
-    # 「按 region 分组」的历史写法：每个 region 都把订单文件**重新读一遍**，
-    # 然后从里面挑出属于这个 region 的行。region 有 R 个，文件就被读 R+1 遍。
-    regions = sorted(set([rec["region"] for rec in records]))
-    per_region = {}
-    for region in regions:
-        again = read_all_rows(orders_path, ORDER_COLUMNS)
-        bucket = []
-        for row in again:
-            month = parse_month(row["ts"])
-            if month is None:
-                continue
-            if row["region"] != region:
-                continue
-            bucket.append((month, parse_amount(row["amount"])))
-        per_region[region] = bucket
 
-    # ===================== 阶段 4：一段没用的「校验」 =====================
-    # 历史上说是为了「防止漏 region」，其实什么都没防住：算出来的
-    # region_row_counts 后面一次都没被用到。R 个 region × N 条记录的双重循环。
-    region_row_counts = {}
-    for region in regions:
-        total = 0
-        for rec in records:
-            if rec["region"] == region:
-                total += 1
-        region_row_counts[region] = total
+# --------------------------------------------------------------------------
+# 阶段 4：退款归属（字典 O(1) 查找，不再线性扫全表）
+# --------------------------------------------------------------------------
+@dataclass
+class RefundAggregation:
+    """退款侧单遍聚合的全部中间结果（金额均为**未舍入**的 float）。"""
 
-    # ===================== 阶段 5：聚合 =====================
-    gross = {}
-    counts = {}
-    for region in regions:
-        for month, amount in per_region[region]:
-            key = (region, month)
-            gross[key] = gross.get(key, 0.0) + amount
-            counts[key] = counts.get(key, 0) + 1
+    refunds: dict[tuple[str, str], float] = field(default_factory=dict)
+    refund_rows: int = 0
+    orphan_refunds: int = 0
 
-    # ===================== 阶段 6：退款归属 =====================
-    # 每笔退款都去 order_ids 里 ``index()`` 线性扫一遍找归属。
-    # ``index()`` 天然返回**首次出现**的下标，正好是口径要求的行为。
-    order_ids = [rec["order_id"] for rec in records]
-    refunds = {}
-    orphan_refunds = 0
-    for row in refund_rows:
-        order_id = row["order_id"]
-        try:
-            idx = order_ids.index(order_id)
-        except ValueError:
-            orphan_refunds += 1
+
+def attribute_refunds(
+    rows: Iterable[dict[str, str]], first_key: dict[str, tuple[str, str]]
+) -> RefundAggregation:
+    """单遍扫描退款行，把每笔退款归到其订单**首次出现**的 ``(region, month)``。
+
+    行为口径（与 legacy 一致）：
+
+    * ``order_id`` 在未被跳过的订单行里找不到 → 计 ``orphan_refunds``，
+      不进任何分组（指向 ts 坏行的退款也算孤儿）；
+    * 退款金额空/坏按 ``0.0``；**负数按 0.0 计**（见怪癖 Q2）；
+    * 组内金额按退款文件出现顺序累加。
+
+    :param rows: :func:`iter_csv_rows` 产出的退款行（列见 ``REFUND_COLUMNS``）。
+    :param first_key: :class:`OrderAggregation` 里的 ``order_id`` 首次归属表。
+    :returns: :class:`RefundAggregation`。
+    """
+    result = RefundAggregation()
+    refunds = result.refunds
+    for row in rows:
+        result.refund_rows += 1
+        key = first_key.get(row["order_id"])
+        if key is None:
+            result.orphan_refunds += 1
             continue
-        rec = records[idx]
-        key = (rec["region"], rec["month"])
         amount = parse_amount(row["amount"])
         if amount < 0.0:
             amount = 0.0
         refunds[key] = refunds.get(key, 0.0) + amount
+    return result
 
-    # ===================== 阶段 7：落盘 =====================
+
+# --------------------------------------------------------------------------
+# 阶段 5：落盘
+# --------------------------------------------------------------------------
+def write_outputs(
+    out_dir: str, orders: OrderAggregation, refunds_agg: RefundAggregation
+) -> dict:
+    """把 ``monthly_region.csv`` 与 ``summary.json`` 写进 ``out_dir``。
+
+    行序为 ``sorted()`` 后的 ``(region, month)`` 字符串字典序；金额一律
+    :func:`fmt_money`；``gross_total`` / ``refund_total`` 按 ``sorted(keys)``
+    的顺序累加（口径 8）；``net_total`` 用**未舍入**的总和相减（见怪癖 Q7）。
+
+    :param out_dir: 输出目录，不存在会自动创建。
+    :param orders: :func:`aggregate_orders` 的返回值。
+    :param refunds_agg: :func:`attribute_refunds` 的返回值。
+    :returns: 写进 ``summary.json`` 的那个字典。
+    """
     os.makedirs(out_dir, exist_ok=True)
+    gross = orders.gross
+    counts = orders.counts
+    refunds = refunds_agg.refunds
 
     keys = sorted(gross)
     with open(os.path.join(out_dir, CSV_FILE), "w", encoding="utf-8", newline="") as fh:
@@ -243,12 +285,12 @@ def run(orders_path, refunds_path, out_dir):
     gross_sum = total_of(gross)
     refund_sum = total_of(refunds)
     summary = {
-        "order_rows": len(raw_rows),
-        "refund_rows": len(refund_rows),
-        "skipped_rows": skipped_rows,
-        "duplicate_order_ids": duplicate_order_ids,
+        "order_rows": orders.order_rows,
+        "refund_rows": refunds_agg.refund_rows,
+        "skipped_rows": orders.skipped_rows,
+        "duplicate_order_ids": orders.duplicate_order_ids,
         "group_count": len(gross),
-        "orphan_refunds": orphan_refunds,
+        "orphan_refunds": refunds_agg.orphan_refunds,
         "gross_total": fmt_money(gross_sum),
         "refund_total": fmt_money(refund_sum),
         "net_total": fmt_money(gross_sum - refund_sum),
@@ -256,14 +298,25 @@ def run(orders_path, refunds_path, out_dir):
     with open(os.path.join(out_dir, SUMMARY_FILE), "w", encoding="utf-8") as fh:
         json.dump(summary, fh, ensure_ascii=False, indent=2, sort_keys=True)
         fh.write("\n")
-
-    if _ROW_CACHE:
-        sys.stderr.write("unreachable\n")
-
     return summary
 
 
-def build_parser():
+# --------------------------------------------------------------------------
+# 流水线入口
+# --------------------------------------------------------------------------
+def run(orders_path: str, refunds_path: str, out_dir: str) -> dict:
+    """跑完整条报表流水线，把两个产物写进 ``out_dir``，返回 summary 字典。
+
+    :param orders_path: 订单 CSV 路径。
+    :param refunds_path: 退款 CSV 路径。
+    :param out_dir: 产物输出目录。
+    """
+    orders = aggregate_orders(iter_csv_rows(orders_path, ORDER_COLUMNS))
+    refunds = attribute_refunds(iter_csv_rows(refunds_path, REFUND_COLUMNS), orders.first_key)
+    return write_outputs(out_dir, orders, refunds)
+
+
+def build_parser() -> argparse.ArgumentParser:
     """构造 CLI 解析器。参数名与默认值和 legacy 完全一致，不得变更。"""
     parser = argparse.ArgumentParser(
         prog="reportbuild",
